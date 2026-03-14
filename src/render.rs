@@ -19,7 +19,9 @@ pub struct GlobeRenderOutput {
 pub struct GlobeVisualState<'a> {
     pub completion_progress: &'a HashMap<String, f32>,
     pub time: f32,
-    pub rotation: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
 }
 
 #[derive(Clone)]
@@ -60,25 +62,30 @@ pub fn paint_globe(
         let mut depth_sum = 0.0f32;
         let mut visible_vertices = 0usize;
         for point in polygon3 {
-            let rotated = rotate_point(point, visuals.rotation, visuals.time);
-            let perspective = 0.7 + ((rotated.z + 1.0) * 0.15);
-            let screen = pos2(
-                center.x + rotated.x * radius * perspective,
-                center.y + rotated.y * radius * perspective,
-            );
+            let rotated = rotate_point(point, visuals.yaw, visuals.pitch, visuals.roll);
+            let screen = project_point(center, radius, rotated);
 
             polygon2.push(screen);
             depth_sum += rotated.z;
             visible_vertices += usize::from(rotated.z > -0.45);
         }
 
-        let center3 = rotate_point(Vec3::from_array(cell.center), visuals.rotation, visuals.time);
-        let projected_center = pos2(center.x + center3.x * radius, center.y + center3.y * radius);
+        let center3 = rotate_point(
+            Vec3::from_array(cell.center),
+            visuals.yaw,
+            visuals.pitch,
+            visuals.roll,
+        );
+        let projected_center = project_point(center, radius, center3);
         let average_depth = depth_sum / polygon2.len() as f32;
 
         if visible_vertices < 4 || average_depth < -0.55 {
             continue;
         }
+
+        let Some(polygon) = sanitize_projected_polygon(polygon2, projected_center, radius) else {
+            continue;
+        };
 
         let progress = visuals
             .completion_progress
@@ -91,7 +98,7 @@ pub fn paint_globe(
 
         projected.push(ProjectedCell {
             task_index: cell.task_index,
-            polygon: polygon2,
+            polygon,
             center: projected_center,
             sphere_center: center3,
             depth: average_depth,
@@ -104,6 +111,18 @@ pub fn paint_globe(
     }
 
     projected.sort_by(|left, right| left.depth.total_cmp(&right.depth));
+
+    let pointer = painter.ctx().pointer_latest_pos();
+    let hovered = pointer.and_then(|pointer| hovered_task_at(pointer, &projected));
+    let highlighted_dependencies = hovered
+        .and_then(|task_index| snapshot.tasks.get(task_index))
+        .map(|task| {
+            task.dependency_ids
+                .iter()
+                .filter_map(|id| task_index.get(id.as_str()).copied())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     if snapshot.tasks.len() <= 250 {
         for cell in &projected {
@@ -121,14 +140,32 @@ pub fn paint_globe(
         }
     }
 
-    let mut hovered = None;
-    let pointer = painter.ctx().pointer_latest_pos();
-
     for cell in &projected {
+        let is_hovered = hovered == Some(cell.task_index);
+        let is_hovered_dependency = highlighted_dependencies.contains(&cell.task_index);
+        let stroke_color = if is_hovered {
+            brighten(cell.outline, 0.45)
+        } else if is_hovered_dependency {
+            Color32::from_rgb(255, 240, 176)
+        } else {
+            cell.outline
+        };
+        let stroke_width = if is_hovered {
+            3.8
+        } else if is_hovered_dependency {
+            3.0
+        } else {
+            2.1
+        };
+
+        painter.add(Shape::closed_line(
+            cell.polygon.clone(),
+            Stroke::new(stroke_width + 2.0, stroke_color.gamma_multiply(0.22)),
+        ));
         painter.add(Shape::convex_polygon(
             cell.polygon.clone(),
             cell.fill,
-            Stroke::new(1.4, cell.outline),
+            Stroke::new(stroke_width, stroke_color),
         ));
 
         if cell.is_done && cell.progress < 1.0 {
@@ -145,26 +182,6 @@ pub fn paint_globe(
         let task = &snapshot.tasks[cell.task_index];
         if !task.dependent_ids.is_empty() {
             painter.circle_filled(cell.center, 3.2, cell.unlock_color);
-        }
-
-        if let Some(pointer) = pointer {
-            if point_in_polygon(pointer, &cell.polygon) {
-                hovered = Some(match hovered {
-                    Some(current) => {
-                        let current_depth = projected
-                            .iter()
-                            .find(|candidate| candidate.task_index == current)
-                            .map(|candidate| candidate.depth)
-                            .unwrap_or(f32::NEG_INFINITY);
-                        if cell.depth >= current_depth {
-                            cell.task_index
-                        } else {
-                            current
-                        }
-                    }
-                    None => cell.task_index,
-                });
-            }
         }
     }
 
@@ -201,10 +218,10 @@ fn build_cell_points(cell: &CellLayout) -> [Vec3; 6] {
     })
 }
 
-fn rotate_point(point: Vec3, rotation: f32, time: f32) -> Vec3 {
-    let spin = rotate_y(point, rotation);
-    let tilt = rotate_x(spin, 0.55 + (time * 0.37).sin() * 0.1);
-    rotate_z(tilt, (time * 0.21).cos() * 0.08)
+fn rotate_point(point: Vec3, yaw: f32, pitch: f32, roll: f32) -> Vec3 {
+    let spin = rotate_y(point, yaw);
+    let tilt = rotate_x(spin, pitch);
+    rotate_z(tilt, roll)
 }
 
 fn rotate_x(point: Vec3, angle: f32) -> Vec3 {
@@ -344,6 +361,60 @@ fn point_in_polygon(point: Pos2, polygon: &[Pos2]) -> bool {
     }
 
     inside
+}
+
+fn hovered_task_at(pointer: Pos2, projected: &[ProjectedCell]) -> Option<usize> {
+    let mut hovered = None;
+    let mut best_depth = f32::NEG_INFINITY;
+
+    for cell in projected {
+        if point_in_polygon(pointer, &cell.polygon) && cell.depth >= best_depth {
+            best_depth = cell.depth;
+            hovered = Some(cell.task_index);
+        }
+    }
+
+    hovered
+}
+
+fn sanitize_projected_polygon(mut polygon: Vec<Pos2>, center: Pos2, radius: f32) -> Option<Vec<Pos2>> {
+    polygon.sort_by(|left, right| {
+        let left_angle = (left.y - center.y).atan2(left.x - center.x);
+        let right_angle = (right.y - center.y).atan2(right.x - center.x);
+        left_angle.total_cmp(&right_angle)
+    });
+
+    let area = polygon_area(&polygon).abs();
+    if area < 8.0 {
+        return None;
+    }
+
+    let mut max_edge = 0.0f32;
+    let mut total_edge = 0.0f32;
+    for index in 0..polygon.len() {
+        let next = (index + 1) % polygon.len();
+        let edge = polygon[index].distance(polygon[next]);
+        max_edge = max_edge.max(edge);
+        total_edge += edge;
+    }
+
+    let average_edge = total_edge / polygon.len() as f32;
+    if max_edge > radius * 0.33 || max_edge > average_edge * 1.9 {
+        return None;
+    }
+
+    Some(polygon)
+}
+
+fn polygon_area(polygon: &[Pos2]) -> f32 {
+    let mut area = 0.0f32;
+
+    for index in 0..polygon.len() {
+        let next = (index + 1) % polygon.len();
+        area += polygon[index].x * polygon[next].y - polygon[next].x * polygon[index].y;
+    }
+
+    area * 0.5
 }
 
 fn paint_dependency_arc(

@@ -6,7 +6,7 @@ Owns the top-level egui application state: current repository path, loaded snaps
 ## Components
 
 ### `GeomancerApp`
-- **Does**: Stores app state, refresh cadence, globe rotation, and completion animation timestamps.
+- **Does**: Stores app state, refresh cadence, globe orientation, auto-spin mode, and completion animation timestamps.
 - **Interacts with**: `load_repository` in `sources/mod.rs`, `paint_globe` in `render.rs`
 
 ### `GeomancerApp::refresh`
@@ -22,7 +22,7 @@ Owns the top-level egui application state: current repository path, loaded snaps
 - **Interacts with**: `GlobeVisualState` in `render.rs`
 
 ### `stats_panel` and `hover_card`
-- **Does**: Render the surrounding repository summary and per-task hover details.
+- **Does**: Render the surrounding repository summary and per-task hover details, including blocker task details for the hovered region.
 - **Interacts with**: `SnapshotStats` and `Task` from `model.rs`
 
 ## Contracts
@@ -31,7 +31,7 @@ Owns the top-level egui application state: current repository path, loaded snaps
 |-----------|---------|------------------|
 | `main.rs` | `GeomancerApp::new` accepts an initial path and eagerly loads data | Changing constructor shape |
 | `render.rs` | Completion progress map is keyed by task id and refreshed every frame | Changing animation state contract |
-| Users | Enter in the repo field or the refresh button triggers a reload | Removing reload controls |
+| Users | Enter in the repo field or the refresh button triggers a reload; drag pauses auto-spin and rotates the globe | Removing reload/inspection controls |
 
 ## Notes
 - Refresh is polling-based for the MVP. A future version can swap in filesystem watchers or source-specific streaming updates without changing the renderer.

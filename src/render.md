@@ -6,7 +6,7 @@ Contains the custom globe painter and the fake-3D projection logic that sells th
 ## Components
 
 ### `GlobeVisualState`
-- **Does**: Bundles the animated render inputs that change frame-to-frame.
+- **Does**: Bundles the current camera orientation and animation inputs that change frame-to-frame.
 - **Interacts with**: `GeomancerApp` in `app.rs`
 
 ### `GlobeRenderOutput`
@@ -14,7 +14,7 @@ Contains the custom globe painter and the fake-3D projection logic that sells th
 - **Interacts with**: Hover UI in `app.rs`
 
 ### `paint_globe`
-- **Does**: Paints the globe, dependency connectors, completion drop animation, and unlock markers.
+- **Does**: Paints the globe, dependency connectors, completion drop animation, unlock markers, and hover/dependency highlight states.
 - **Interacts with**: `CellLayout` from `layout.rs`, `TaskSnapshot` from `model.rs`
 
 ### Projection and color helpers
@@ -24,6 +24,10 @@ Contains the custom globe painter and the fake-3D projection logic that sells th
 
 ### `paint_dependency_arc`
 - **Does**: Draws dependency links as visible front-hemisphere arcs instead of flat chords across the viewport.
+- **Interacts with**: `paint_globe`
+
+### `sanitize_projected_polygon`
+- **Does**: Reorders projected vertices and rejects degenerate or spike-prone polygons before they are painted.
 - **Interacts with**: `paint_globe`
 
 ## Contracts
@@ -37,3 +41,4 @@ Contains the custom globe painter and the fake-3D projection logic that sells th
 ## Notes
 - The branch coloring is intentionally approximate: it hashes local/root dependency signatures to give DAG neighborhoods a visual lineage without solving a full region-partitioning problem.
 - Long stray edges from the first MVP were caused by seam-crossing longitude polygons and flat dependency chords; this renderer now avoids both by staying in sphere space until projection.
+- If tangent spikes reappear, the next step is polygon clipping against the horizon rather than heuristic rejection.

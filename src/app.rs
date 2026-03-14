@@ -4,11 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eframe::egui::{self, Align, Color32, Layout, RichText};
+use eframe::egui::{self, Align, Color32, Layout, RichText, Sense};
 
 use crate::{
     layout::{layout_cells, CellLayout},
-    model::{SnapshotStats, Task, TaskSnapshot},
+    model::{SnapshotStats, TaskSnapshot},
     render::{paint_globe, GlobeVisualState},
     sources,
 };
@@ -21,7 +21,9 @@ pub struct GeomancerApp {
     snapshot: TaskSnapshot,
     layout: Vec<CellLayout>,
     last_refresh: Instant,
-    rotation: f32,
+    yaw: f32,
+    pitch: f32,
+    auto_spin: bool,
     previous_done: HashMap<String, bool>,
     completion_started: HashMap<String, Instant>,
     load_error: Option<String>,
@@ -35,7 +37,9 @@ impl GeomancerApp {
             snapshot: TaskSnapshot::empty(initial_path),
             layout: Vec::new(),
             last_refresh: Instant::now() - Duration::from_secs(30),
-            rotation: 0.0,
+            yaw: 0.0,
+            pitch: 0.55,
+            auto_spin: true,
             previous_done: HashMap::new(),
             completion_started: HashMap::new(),
             load_error: None,
@@ -120,7 +124,9 @@ impl GeomancerApp {
 impl eframe::App for GeomancerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let delta = ctx.input(|input| input.unstable_dt).max(1.0 / 120.0);
-        self.rotation += delta * 0.22;
+        if self.auto_spin {
+            self.yaw += delta * 0.22;
+        }
 
         if self.last_refresh.elapsed().as_secs_f32() >= AUTO_REFRESH_SECONDS {
             self.refresh();
@@ -144,6 +150,15 @@ impl eframe::App for GeomancerApp {
 
                     if ui.button("Refresh").clicked() {
                         self.refresh();
+                    }
+                    let spin_label = if self.auto_spin { "Pause spin" } else { "Resume spin" };
+                    if ui.button(spin_label).clicked() {
+                        self.auto_spin = !self.auto_spin;
+                    }
+                    if ui.button("Reset view").clicked() {
+                        self.yaw = 0.0;
+                        self.pitch = 0.55;
+                        self.auto_spin = false;
                     }
                 });
             });
@@ -196,25 +211,38 @@ impl eframe::App for GeomancerApp {
                     self.snapshot.root.display()
                 );
                 ui.label(RichText::new(header).color(Color32::from_rgb(255, 172, 135)));
+                ui.small("Drag to inspect. Hovering or dragging pauses auto-spin.");
                 ui.add_space(12.0);
 
-                let available = ui.available_rect_before_wrap();
+                let available = ui.available_rect_before_wrap().shrink2(egui::vec2(12.0, 12.0));
+                let response = ui.interact(available, ui.id().with("globe"), Sense::click_and_drag());
+                if response.hovered() || response.dragged() || response.clicked() {
+                    self.auto_spin = false;
+                }
+                if response.dragged() {
+                    let drag = ctx.input(|input| input.pointer.delta());
+                    self.yaw += drag.x * 0.0045;
+                    self.pitch = (self.pitch - drag.y * 0.0045).clamp(-1.2, 1.2);
+                    ctx.request_repaint();
+                }
+
                 let painter = ui.painter_at(available);
                 let render = paint_globe(
                     &painter,
-                    available.shrink2(egui::vec2(12.0, 12.0)),
+                    available,
                     &self.snapshot,
                     &self.layout,
                     GlobeVisualState {
                         completion_progress: &completion_progress,
                         time: ctx.input(|input| input.time) as f32,
-                        rotation: self.rotation,
+                        yaw: self.yaw,
+                        pitch: self.pitch,
+                        roll: 0.0,
                     },
                 );
 
-                if let Some(task_index) = render.hovered_task.and_then(|index| self.snapshot.tasks.get(index))
-                {
-                    hover_card(ctx, task_index);
+                if let Some(task_index) = render.hovered_task {
+                    hover_card(ctx, &self.snapshot, task_index);
                 }
             });
 
@@ -233,10 +261,20 @@ fn stats_panel(ui: &mut egui::Ui, stats: SnapshotStats) {
     ui.label(format!("Open       {}", stats.open));
 }
 
-fn hover_card(ctx: &egui::Context, task: &Task) {
+fn hover_card(ctx: &egui::Context, snapshot: &TaskSnapshot, task_index: usize) {
     let Some(pointer) = ctx.pointer_latest_pos() else {
         return;
     };
+    let Some(task) = snapshot.tasks.get(task_index) else {
+        return;
+    };
+    let task_lookup = snapshot.task_index();
+    let blockers: Vec<_> = task
+        .dependency_ids
+        .iter()
+        .filter_map(|id| task_lookup.get(id.as_str()).copied())
+        .filter_map(|index| snapshot.tasks.get(index))
+        .collect();
 
     egui::Area::new("task-hover-card".into())
         .order(egui::Order::Foreground)
@@ -267,6 +305,14 @@ fn hover_card(ctx: &egui::Context, task: &Task) {
 
                     ui.small(format!("depends on: {}", task.dependency_ids.len()));
                     ui.small(format!("unlocks: {}", task.dependent_ids.len()));
+
+                    if !blockers.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Blocking beads").color(Color32::from_rgb(255, 214, 128)));
+                        for blocker in blockers {
+                            ui.small(format!("{} [{}]", blocker.title, blocker.status.label()));
+                        }
+                    }
                 });
         });
 }
