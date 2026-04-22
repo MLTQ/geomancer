@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::model::{LoadedSource, Task, TaskSnapshot};
+use crate::model::{LoadedSource, Task, TaskSnapshot, TrailEvent};
 
 pub fn load_repository(root: &Path) -> Result<TaskSnapshot, String> {
     let canonical_root = root
@@ -19,6 +19,7 @@ pub fn load_repository(root: &Path) -> Result<TaskSnapshot, String> {
 
     let mut snapshot = TaskSnapshot::empty(canonical_root.clone());
     let mut tasks = Vec::new();
+    let mut trail_events = Vec::new();
     let mut warnings = Vec::new();
     let mut sources = Vec::new();
 
@@ -32,6 +33,7 @@ pub fn load_repository(root: &Path) -> Result<TaskSnapshot, String> {
                         detail: "Loaded through `bd list --json`".to_owned(),
                     });
                 }
+                trail_events.extend(result.trail_events);
                 warnings.extend(result.warnings);
                 tasks.extend(result.tasks);
             }
@@ -47,7 +49,8 @@ pub fn load_repository(root: &Path) -> Result<TaskSnapshot, String> {
                     task_count: result.tasks.len(),
                     detail: "Checklist items from repo markdown".to_owned(),
                 });
-            }
+                }
+            trail_events.extend(result.trail_events);
             warnings.extend(result.warnings);
             tasks.extend(result.tasks);
         }
@@ -64,6 +67,7 @@ pub fn load_repository(root: &Path) -> Result<TaskSnapshot, String> {
     deduplicate_warnings(&mut warnings);
 
     snapshot.tasks = tasks;
+    snapshot.trail_events = trail_events;
     snapshot.sources = sources;
     snapshot.warnings = warnings;
     Ok(snapshot)
@@ -98,5 +102,6 @@ fn deduplicate_warnings(warnings: &mut Vec<String>) {
 #[derive(Default)]
 pub struct SourceLoadResult {
     pub tasks: Vec<Task>,
+    pub trail_events: Vec<TrailEvent>,
     pub warnings: Vec<String>,
 }

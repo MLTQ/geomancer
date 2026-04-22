@@ -42,6 +42,8 @@ pub fn load(root: &Path) -> Result<SourceLoadResult, String> {
                 source: "markdown".to_owned(),
                 source_path: Some(file.display().to_string()),
                 assignee: None,
+                claimed_at: None,
+                completed_at: None,
                 updated_at: None,
                 dependency_ids: Vec::new(),
                 dependent_ids: Vec::new(),
@@ -52,6 +54,7 @@ pub fn load(root: &Path) -> Result<SourceLoadResult, String> {
 
     Ok(SourceLoadResult {
         tasks,
+        trail_events: Vec::new(),
         warnings: Vec::new(),
     })
 }

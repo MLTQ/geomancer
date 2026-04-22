@@ -34,9 +34,6 @@ impl TaskStatus {
         matches!(self, Self::Done)
     }
 
-    pub fn is_blocked(&self) -> bool {
-        matches!(self, Self::Blocked)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +44,8 @@ pub struct Task {
     pub source: String,
     pub source_path: Option<String>,
     pub assignee: Option<String>,
+    pub claimed_at: Option<String>,
+    pub completed_at: Option<String>,
     pub updated_at: Option<String>,
     pub dependency_ids: Vec<String>,
     pub dependent_ids: Vec<String>,
@@ -57,14 +56,20 @@ impl Task {
     pub fn is_done(&self) -> bool {
         self.status.is_done()
     }
+}
 
-    pub fn is_blocked(&self) -> bool {
-        self.status.is_blocked()
-            || self
-                .dependency_ids
-                .iter()
-                .any(|dependency| !dependency.is_empty())
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrailEventKind {
+    Claimed,
+    Completed,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrailEvent {
+    pub task_id: String,
+    pub actor: String,
+    pub timestamp: String,
+    pub kind: TrailEventKind,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -78,6 +83,7 @@ pub struct LoadedSource {
 pub struct TaskSnapshot {
     pub root: PathBuf,
     pub tasks: Vec<Task>,
+    pub trail_events: Vec<TrailEvent>,
     pub sources: Vec<LoadedSource>,
     pub warnings: Vec<String>,
 }
@@ -87,6 +93,7 @@ impl TaskSnapshot {
         Self {
             root,
             tasks: Vec::new(),
+            trail_events: Vec::new(),
             sources: Vec::new(),
             warnings: Vec::new(),
         }

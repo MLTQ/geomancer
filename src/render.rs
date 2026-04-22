@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     f32::consts::TAU,
 };
 
@@ -9,13 +9,14 @@ use egui::{
 
 use crate::{
     layout::CellLayout,
-    model::{Task, TaskSnapshot},
+    model::{Task, TaskSnapshot, TrailEventKind},
 };
 
 pub struct GlobeRenderOutput {
     pub hovered_task: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
 pub struct GlobeVisualState<'a> {
     pub completion_progress: &'a HashMap<String, f32>,
     pub time: f32,
@@ -162,11 +163,15 @@ pub fn paint_globe(
             cell.polygon.clone(),
             Stroke::new(stroke_width + 2.0, stroke_color.gamma_multiply(0.22)),
         ));
-        painter.add(Shape::convex_polygon(
-            cell.polygon.clone(),
-            cell.fill,
-            Stroke::new(stroke_width, stroke_color),
-        ));
+        if cell.is_done {
+            painter.add(Shape::convex_polygon(
+                cell.polygon.clone(),
+                cell.fill,
+                Stroke::new(stroke_width, stroke_color),
+            ));
+        } else {
+            paint_wireframe_cell(painter, &cell.polygon, cell.center, stroke_color, stroke_width);
+        }
 
         if cell.is_done && cell.progress < 1.0 {
             let drop_offset = vec2(0.0, -rect.height() * 0.55 * (1.0 - cell.progress).powi(2));
@@ -185,6 +190,8 @@ pub fn paint_globe(
         }
     }
 
+    paint_timeline_trails(painter, snapshot, layout, center, radius, visuals);
+
     GlobeRenderOutput {
         hovered_task: hovered,
     }
@@ -200,6 +207,42 @@ fn paint_background(painter: &Painter, center: Pos2, radius: f32, time: f32) {
             center,
             radius * ring,
             Stroke::new(0.9, Color32::from_rgba_premultiplied(255, 96, 58, alpha)),
+        );
+    }
+}
+
+fn paint_timeline_trails(
+    painter: &Painter,
+    snapshot: &TaskSnapshot,
+    layout: &[CellLayout],
+    center: Pos2,
+    radius: f32,
+    visuals: GlobeVisualState<'_>,
+) {
+    let claimed = build_trail_groups(snapshot, layout, TrailKind::Claimed);
+    let completed = build_trail_groups(snapshot, layout, TrailKind::Completed);
+
+    for (index, group) in claimed.iter().enumerate() {
+        paint_trail_group(
+            painter,
+            &group.paths,
+            center,
+            radius,
+            1.13 + index as f32 * 0.018,
+            Color32::from_rgba_premultiplied(120, 214, 255, 165),
+            visuals,
+        );
+    }
+
+    for (index, group) in completed.iter().enumerate() {
+        paint_trail_group(
+            painter,
+            &group.paths,
+            center,
+            radius,
+            1.19 + index as f32 * 0.018,
+            Color32::from_rgba_premultiplied(112, 255, 164, 180),
+            visuals,
         );
     }
 }
@@ -255,26 +298,16 @@ fn rotate_z(point: Vec3, angle: f32) -> Vec3 {
 }
 
 fn fill_color(task: &Task, depth: f32, progress: f32) -> Color32 {
-    let shade = lerp(0.55..=1.0, (depth + 1.0) * 0.5);
-    if task.is_done() {
-        mix(
-            Color32::from_rgb(247, 104, 48),
-            Color32::from_rgb(214, 24, 48),
-            progress * shade,
-        )
-    } else if task.is_blocked() {
-        Color32::from_rgb(
-            (116.0 * shade) as u8,
-            (74.0 * shade) as u8,
-            (32.0 * shade) as u8,
-        )
-    } else {
-        Color32::from_rgb(
-            (206.0 * shade) as u8,
-            (124.0 * shade) as u8,
-            (42.0 * shade) as u8,
-        )
+    if !task.is_done() {
+        return Color32::TRANSPARENT;
     }
+
+    let shade = lerp(0.55..=1.0, (depth + 1.0) * 0.5);
+    mix(
+        Color32::from_rgb(247, 104, 48),
+        Color32::from_rgb(214, 24, 48),
+        progress * shade,
+    )
 }
 
 fn lineage_color(
@@ -363,6 +396,167 @@ fn point_in_polygon(point: Pos2, polygon: &[Pos2]) -> bool {
     inside
 }
 
+fn build_trail_groups(
+    snapshot: &TaskSnapshot,
+    layout: &[CellLayout],
+    kind: TrailKind,
+) -> Vec<TrailGroup> {
+    if !snapshot.trail_events.is_empty() {
+        let groups = build_activity_trail_groups(snapshot, layout, kind);
+        if !groups.is_empty() {
+            return groups;
+        }
+    }
+
+    let layout_by_index: HashMap<usize, [f32; 3]> = layout
+        .iter()
+        .map(|cell| (cell.task_index, cell.center))
+        .collect();
+    let mut grouped: BTreeMap<String, Vec<TrailNode>> = BTreeMap::new();
+
+    for task in snapshot.tasks.iter().enumerate() {
+        let (task_index, task) = task;
+        let Some(center) = layout_by_index.get(&task_index).copied() else {
+            continue;
+        };
+        if !task_matches_trail_kind(task, kind) {
+            continue;
+        }
+
+        let timestamp = trail_sort_key(task, kind).to_owned();
+        let owner = task
+            .assignee
+            .clone()
+            .unwrap_or_else(|| format!("{}:shared", task.source));
+        grouped
+            .entry(owner)
+            .or_default()
+            .push(TrailNode {
+                task_index,
+                timestamp,
+                point: Vec3::from_array(center),
+            });
+    }
+
+    grouped
+        .into_iter()
+        .map(|(_, mut nodes)| {
+            nodes.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+            let ordered = order_nodes_cleanly(&nodes);
+            TrailGroup { paths: vec![ordered] }
+        })
+        .filter(|group| !group.paths.is_empty() && !group.paths[0].is_empty())
+        .collect()
+}
+
+fn build_activity_trail_groups(
+    snapshot: &TaskSnapshot,
+    layout: &[CellLayout],
+    kind: TrailKind,
+) -> Vec<TrailGroup> {
+    let task_index = snapshot.task_index();
+    let layout_by_task_id: HashMap<_, _> = layout
+        .iter()
+        .filter_map(|cell| snapshot.tasks.get(cell.task_index).map(|task| (task.id.as_str(), cell.center)))
+        .collect();
+    let target_kind = match kind {
+        TrailKind::Claimed => TrailEventKind::Claimed,
+        TrailKind::Completed => TrailEventKind::Completed,
+    };
+    let mut grouped: BTreeMap<String, Vec<TrailNode>> = BTreeMap::new();
+
+    for event in &snapshot.trail_events {
+        if event.kind != target_kind {
+            continue;
+        }
+        let Some(center) = layout_by_task_id.get(event.task_id.as_str()).copied() else {
+            continue;
+        };
+        let Some(&task_position) = task_index.get(event.task_id.as_str()) else {
+            continue;
+        };
+
+        grouped
+            .entry(event.actor.clone())
+            .or_default()
+            .push(TrailNode {
+                task_index: task_position,
+                timestamp: event.timestamp.clone(),
+                point: Vec3::from_array(center),
+            });
+    }
+
+    grouped
+        .into_iter()
+        .map(|(_, mut nodes)| {
+            nodes.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+            nodes.dedup_by(|left, right| {
+                left.task_index == right.task_index && left.timestamp == right.timestamp
+            });
+
+            TrailGroup {
+                paths: vec![nodes.into_iter().map(|node| node.point).collect()],
+            }
+        })
+        .filter(|group| !group.paths.is_empty() && !group.paths[0].is_empty())
+        .collect()
+}
+
+fn paint_trail_group(
+    painter: &Painter,
+    paths: &[Vec<Vec3>],
+    center: Pos2,
+    radius: f32,
+    shell_scale: f32,
+    color: Color32,
+    visuals: GlobeVisualState<'_>,
+) {
+    for (path_index, path) in paths.iter().enumerate() {
+        if path.is_empty() {
+            continue;
+        }
+
+        let rotated: Vec<_> = path
+            .iter()
+            .map(|point| rotate_point(*point, visuals.yaw, visuals.pitch, visuals.roll))
+            .collect();
+        let line_color = if path_index == 0 {
+            color
+        } else {
+            color.gamma_multiply(0.68)
+        };
+        let point_radius = if path_index == 0 { 2.8 } else { 2.1 };
+
+        if rotated.len() == 1 {
+            let point = rotated[0];
+            if point.z > -0.15 {
+                painter.circle_filled(
+                    project_shell_point(center, radius, shell_scale, point),
+                    point_radius,
+                    line_color,
+                );
+            }
+            continue;
+        }
+
+        for window in rotated.windows(2) {
+            let from = window[0];
+            let to = window[1];
+            paint_outer_arc(painter, center, radius, shell_scale, from, to, line_color);
+        }
+
+        for point in rotated {
+            if point.z > -0.15 {
+                painter.circle_filled(
+                    project_shell_point(center, radius, shell_scale, point),
+                    point_radius,
+                    line_color.gamma_multiply(0.9),
+                );
+            }
+        }
+    }
+}
+
 fn hovered_task_at(pointer: Pos2, projected: &[ProjectedCell]) -> Option<usize> {
     let mut hovered = None;
     let mut best_depth = f32::NEG_INFINITY;
@@ -417,6 +611,74 @@ fn polygon_area(polygon: &[Pos2]) -> f32 {
     area * 0.5
 }
 
+fn paint_wireframe_cell(
+    painter: &Painter,
+    polygon: &[Pos2],
+    center: Pos2,
+    stroke_color: Color32,
+    stroke_width: f32,
+) {
+    for (index, scale) in [1.0, 0.78, 0.58].into_iter().enumerate() {
+        let ring = scale_polygon(polygon, center, scale);
+        let alpha = match index {
+            0 => 0.95,
+            1 => 0.48,
+            _ => 0.28,
+        };
+        let width = (stroke_width - index as f32 * 0.45).max(0.8);
+        painter.add(Shape::closed_line(
+            ring,
+            Stroke::new(width, stroke_color.gamma_multiply(alpha)),
+        ));
+    }
+}
+
+fn scale_polygon(polygon: &[Pos2], center: Pos2, scale: f32) -> Vec<Pos2> {
+    polygon
+        .iter()
+        .map(|point| center + (*point - center) * scale)
+        .collect()
+}
+
+fn paint_outer_arc(
+    painter: &Painter,
+    center: Pos2,
+    radius: f32,
+    shell_scale: f32,
+    from: Vec3,
+    to: Vec3,
+    color: Color32,
+) {
+    let dot = from.dot(to).clamp(-1.0, 1.0);
+    let omega = dot.acos();
+
+    if omega <= 0.001 {
+        return;
+    }
+
+    let sin_omega = omega.sin();
+    let mut previous = None;
+    let steps = 24usize;
+
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let a = ((1.0 - t) * omega).sin() / sin_omega;
+        let b = (t * omega).sin() / sin_omega;
+        let lifted = from.scale(a).add(to.scale(b)).normalized().scale(shell_scale);
+
+        if lifted.z <= -0.05 {
+            previous = None;
+            continue;
+        }
+
+        let projected = project_outer_point(center, radius, lifted);
+        if let Some(prev) = previous {
+            painter.line_segment([prev, projected], Stroke::new(1.8, color));
+        }
+        previous = Some(projected);
+    }
+}
+
 fn paint_dependency_arc(
     painter: &Painter,
     globe_center: Pos2,
@@ -468,6 +730,18 @@ fn project_point(center: Pos2, radius: f32, point: Vec3) -> Pos2 {
     )
 }
 
+fn project_shell_point(center: Pos2, radius: f32, shell_scale: f32, point: Vec3) -> Pos2 {
+    project_outer_point(center, radius, point.scale(shell_scale))
+}
+
+fn project_outer_point(center: Pos2, radius: f32, point: Vec3) -> Pos2 {
+    let perspective = 0.68 + ((point.z + 1.0) * 0.14);
+    pos2(
+        center.x + point.x * radius * perspective,
+        center.y + point.y * radius * perspective,
+    )
+}
+
 fn tangent_basis(center: Vec3) -> (Vec3, Vec3) {
     let reference = if center.y.abs() > 0.92 {
         Vec3::new(1.0, 0.0, 0.0)
@@ -484,6 +758,72 @@ struct Vec3 {
     x: f32,
     y: f32,
     z: f32,
+}
+
+#[derive(Clone, Copy)]
+enum TrailKind {
+    Claimed,
+    Completed,
+}
+
+struct TrailGroup {
+    paths: Vec<Vec<Vec3>>,
+}
+
+struct TrailNode {
+    task_index: usize,
+    timestamp: String,
+    point: Vec3,
+}
+
+fn claimed_sort_key(task: &Task) -> Option<&str> {
+    task.claimed_at
+        .as_deref()
+        .or(task.updated_at.as_deref())
+}
+
+fn completed_sort_key(task: &Task) -> Option<&str> {
+    task.completed_at
+        .as_deref()
+        .or(task.updated_at.as_deref())
+}
+
+fn task_matches_trail_kind(task: &Task, kind: TrailKind) -> bool {
+    match kind {
+        TrailKind::Claimed => matches!(task.status, crate::model::TaskStatus::InProgress),
+        TrailKind::Completed => task.is_done(),
+    }
+}
+
+fn trail_sort_key<'a>(task: &'a Task, kind: TrailKind) -> &'a str {
+    match kind {
+        TrailKind::Claimed => claimed_sort_key(task).unwrap_or(task.id.as_str()),
+        TrailKind::Completed => completed_sort_key(task).unwrap_or(task.id.as_str()),
+    }
+}
+
+fn order_nodes_cleanly(nodes: &[TrailNode]) -> Vec<Vec3> {
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut remaining: Vec<_> = nodes.iter().map(|node| node.point).collect();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    let start = remaining.remove(0);
+    ordered.push(start);
+
+    while !remaining.is_empty() {
+        let current = *ordered.last().unwrap_or(&start);
+        let (next_index, _) = remaining
+            .iter()
+            .enumerate()
+            .map(|(index, point)| (index, current.distance_to(*point)))
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .unwrap_or((0, 0.0));
+        ordered.push(remaining.remove(next_index));
+    }
+
+    ordered
 }
 
 impl Vec3 {
@@ -517,6 +857,10 @@ impl Vec3 {
 
     fn length(self) -> f32 {
         self.dot(self).sqrt()
+    }
+
+    fn distance_to(self, other: Self) -> f32 {
+        self.add(other.scale(-1.0)).length()
     }
 
     fn normalized(self) -> Self {
